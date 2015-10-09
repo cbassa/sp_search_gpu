@@ -74,7 +74,7 @@ __global__ void unpadd_data(float *y,float *ytmp,int n,int nx,int m,int ny)
       k=i+nx*j;
       if (k<nx*ny) {
 	l=i+m*j-ioverlap;
-	if (l>=0 && l<n)
+	if (l>=0 && l<n && i>=ioverlap && i<m+ioverlap)
 	  y[l]=ytmp[k];
       }
     }
