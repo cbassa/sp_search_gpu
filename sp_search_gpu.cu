@@ -113,6 +113,8 @@ __global__ void prune_final(float *z,int *dw,int *mask,int n,float sigma)
 
   for (i=threadID;i<n;i+=numThreads) {
     mask[i]=1;
+
+    // Mask candidates within half-width with lower significance
     if (z[i]>sigma) {
       for (j=i-dw[i]/2;j<=i+dw[i]/2;j++) {
 	if (j<0 || j>=n)
@@ -331,7 +333,7 @@ int main(int argc,char *argv[])
   char *datfname,*inffname,*spfname;
   int arg=0,len;
 
-  // Decode options                                                             
+  // Decode options
   if (argc>1) {
     while ((arg=getopt(argc,argv,"hm:t:"))!=-1) {
       switch(arg) {
@@ -399,10 +401,10 @@ int main(int argc,char *argv[])
   }
 
   // Read buffer
-  fread(x,sizeof(float),n,file);                                                        
-                                                                                        
-  // Close file                                                                         
-  fclose(file);                                                                         
+  fread(x,sizeof(float),n,file);
+
+  // Close file
+  fclose(file);
    
   // Sizes
   m=8000;
@@ -426,8 +428,8 @@ int main(int argc,char *argv[])
   nthread=256;
   nblock=ndetrend/nthread+1;
 
-  // Detrend timeseries                                                                 
-  detrend_and_normalize<<<nblock,nthread>>>(dxs,dzs,n,mdetrend);                   
+  // Detrend timeseries
+  detrend_and_normalize<<<nblock,nthread>>>(dxs,dzs,n,mdetrend);
 
   // Allocate memory for padded signal
   checkCudaErrors(cudaMalloc((void **) &dx,sizeof(cufftReal)*nx*ny));
@@ -479,6 +481,10 @@ int main(int argc,char *argv[])
   idist=nx;  odist=mx;  iembed=nx;  oembed=nx;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftr2cy,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_R2C,my));
   checkCudaErrors(cufftExecR2C(ftr2cy,(cufftReal *) dy,(cufftComplex *) dcy));
+
+  // Free input arrays
+  cudaFree(dx);
+  cudaFree(dy);
 
   // Plan convolved signal
   idist=mx;  odist=nx;  iembed=mx;  oembed=mx;  istride=1;  ostride=1;
@@ -544,19 +550,6 @@ int main(int argc,char *argv[])
   fclose(file);
   printf("Found %d candidates\n",j);
 
-  /*
-  printf("dxs: %d\n",sizeof(float)*n);
-  printf("dx:  %d\n",sizeof(cufftReal)*nx*ny);
-  printf("dzs: %d\n",sizeof(float)*n);
-  printf("dy:  %d\n",sizeof(cufftReal)*nx*my);
-  printf("dz:  %d\n",sizeof(cufftReal)*nx*ny);
-  printf("dcx: %d\n",sizeof(cufftComplex)*mx*ny);
-  printf("dcy: %d\n",sizeof(cufftComplex)*mx*my);
-  printf("dcz: %d\n",sizeof(cufftComplex)*mx*ny);
-  printf("mask: %d\n",sizeof(int)*n);
-  printf("w: %d\n",sizeof(int)*n);
-  */
-
   // Destroy plans
   cufftDestroy(ftr2cx);
   cufftDestroy(ftr2cy);
@@ -568,8 +561,6 @@ int main(int argc,char *argv[])
   free(z);
   free(w);
   free(mask);
-  cudaFree(dx);
-  cudaFree(dy);
   cudaFree(dz);
   cudaFree(dcx);
   cudaFree(dcy);
