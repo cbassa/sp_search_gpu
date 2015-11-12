@@ -25,104 +25,120 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
   return c;
 }
 
-static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int n,int m,int j,float scale)
+static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nbin,int nfft,int ndm,int ikern,float scale)
 {
-  int i;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
-
-  for (i=threadID;i<n;i+=numThreads)
-    c[i]=ComplexScale(ComplexMul(a[i],b[i%m+j*m]),scale);
-}
-
-__global__ void padd_data(float *y,float *ytmp,int nsamp,int nbin,int m,int nfft)
-{
-  int isamp,idx,ibin,ifft,ioverlap;
+  int ibin,ifft,idm,idx1,idx2;
 
   // Indices of input data                                                                    
   ibin=blockIdx.x*blockDim.x+threadIdx.x;
   ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  idm=blockIdx.z*blockDim.z+threadIdx.z;
 
   // Compute valid threads
-  if (ibin<nbin && ifft<nfft) {
+  if (ibin<nbin && ifft<nfft && idm<ndm) {
+    idx1=ibin+ifft*nbin+idm*nbin*nfft;
+    idx2=ibin+ikern*nbin;
+    c[idx1]=ComplexScale(ComplexMul(a[idx1],b[idx2]),scale);
+  }
+}
+
+__global__ void padd_data(float *ytmp,float *y,int nsamp,int nbin,int m,int nfft,int ndm)
+{
+  int isamp,idx1,idx2,ibin,ifft,idm,ioverlap;
+
+  // Indices of input data                                                                    
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  idm=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Compute valid threads
+  if (ibin<nbin && ifft<nfft && idm<ndm) {
     ioverlap=(nbin-m)/2;
     
-    for (ifft=0;ifft<nfft;ifft++) {
-      idx=ibin+nbin*ifft;
-      if (idx<nbin*nfft) {
-	isamp=ibin+m*ifft-ioverlap;
-	if (isamp<0 || isamp>=nsamp)
-	  ytmp[idx]=0.0;
-	else
-	  ytmp[idx]=y[isamp];
-      }
-    }
+    idx1=ibin+nbin*ifft+idm*nbin*nfft;
+    isamp=ibin+m*ifft-ioverlap;
+    idx2=isamp+idm*nsamp;
+    if (isamp<0 || isamp>=nsamp)
+      ytmp[idx1]=0.0;
+    else
+      ytmp[idx1]=y[idx2];
   }
   
   return;
 }
 
-__global__ void unpadd_data(float *y,float *ytmp,int n,int nx,int m,int ny)
+__global__ void unpadd_data(float *y,float *ytmp,int nsamp,int nbin,int m,int nfft,int ndm)
 {
-  int i,j,k,l;
-  int ioverlap;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
+  int ibin,ifft,idm,isamp,idx1,idx2,ioverlap;
 
-  for (i=threadID;i<nx;i+=numThreads) {
-    ioverlap=(nx-m)/2;
+  // Indices of input data                                                                    
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  idm=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Compute valid threads
+  if (ibin<nbin && ifft<nfft) {
+    ioverlap=(nbin-m)/2;
     
-    for (j=0;j<ny;j++) {
-      k=i+nx*j;
-      if (k<nx*ny) {
-	l=i+m*j-ioverlap;
-	if (l>=0 && l<n && i>=ioverlap && i<m+ioverlap)
-	  y[l]=ytmp[k];
-      }
+    idx1=ibin+nbin*ifft+idm*nbin*nfft;
+    isamp=ibin+m*ifft-ioverlap;
+    idx2=isamp+idm*nsamp;
+    if (isamp>=0 && isamp<nsamp && ibin>=ioverlap && ibin<m+ioverlap) 
+	y[idx2]=ytmp[idx1];
+  }
+
+  return;
+}
+
+__global__ void prune(float *z,int nsamp,int ndm,int dw,int *mask,float sigma)
+{
+  int isamp,idm,idx1,idx2,jsamp;
+
+  // Indices of input data
+  isamp=blockIdx.x*blockDim.x+threadIdx.x;
+  idm=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Compute valid threads
+  if (isamp<nsamp && idm<ndm) {
+    idx1=isamp+idm*nsamp;
+    mask[idx1]=1;
+    if (z[idx1]<sigma) 
+      mask[idx1]=0;
+    for (jsamp=isamp-dw/2;jsamp<=isamp+dw/2;jsamp++) {
+      if (jsamp<0 || jsamp>=nsamp)
+	continue;
+      idx2=jsamp+idm*nsamp;
+      if (z[idx2]<sigma)
+	continue;
+      if (z[idx2]>z[idx1])
+	mask[idx1]=0;
     }
   }
 
   return;
 }
 
-__global__ void prune(float *z,int n,int dw,int *mask,float sigma)
+__global__ void prune_final(float *z,int *dw,int *mask,int nsamp,int ndm,float sigma)
 {
-  int i,j;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
+  int isamp,jsamp,idx1,idx2,idm;
 
-  for (i=threadID;i<n;i+=numThreads) {
-    mask[i]=1;
-    if (z[i]<sigma) 
-      mask[i]=0;
-    for (j=i-dw/2;j<=i+dw/2;j++) {
-      if (j<0 || j>=n)
-	continue;
-      if (z[j]<sigma)
-	continue;
-      if (z[j]>z[i])
-	mask[i]=0;
-    }
-  }
-  return;
-}
+  // Indices of input data
+  isamp=blockIdx.x*blockDim.x+threadIdx.x;
+  idm=blockIdx.y*blockDim.y+threadIdx.y;
 
-__global__ void prune_final(float *z,int *dw,int *mask,int n,float sigma)
-{
-  int i,j;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
-
-  for (i=threadID;i<n;i+=numThreads) {
-    mask[i]=1;
+  // Compute valid threads
+  if (isamp<nsamp && idm<ndm) {
+    idx1=isamp+idm*nsamp;
+    mask[idx1]=1;
 
     // Mask candidates within half-width with lower significance
-    if (z[i]>sigma) {
-      for (j=i-dw[i]/2;j<=i+dw[i]/2;j++) {
-	if (j<0 || j>=n)
+    if (z[idx1]>sigma) {
+      for (jsamp=isamp-dw[idx1]/2;jsamp<=isamp+dw[idx1]/2;jsamp++) {
+	if (jsamp<0 || jsamp>=nsamp)
 	  continue;
-	if (z[j]<z[i])
-	  mask[j]=0;
+	idx2=jsamp+idm*nsamp;
+	if (z[idx2]<z[idx1])
+	  mask[idx2]=0;
       }
     }
   }
@@ -130,32 +146,40 @@ __global__ void prune_final(float *z,int *dw,int *mask,int n,float sigma)
   return;
 }
 
-__global__ void store(float *x,float *z,int *mask,int *w,int wnew,int n)
+__global__ void store(float *x,float *z,int *mask,int *w,int wnew,int nsamp,int ndm)
 {
-  int i;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
+  int isamp,idm,idx;
 
-  for (i=threadID;i<n;i+=numThreads) {
-    if (z[i]*mask[i]>x[i]) {
-      x[i]=z[i]*mask[i];
-      w[i]=wnew;
+  // Indices of input data
+  isamp=blockIdx.x*blockDim.x+threadIdx.x;
+  idm=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Compute valid threads
+  if (isamp<nsamp && idm<ndm) {
+    idx=isamp+idm*nsamp;
+    if (z[idx]*mask[idx]>x[idx]) {
+      x[idx]=z[idx]*mask[idx];
+      w[idx]=wnew;
     }
   }
 
   return;
 }
 
-__global__ void store_final(float *x,int *mask,int n,float sigma)
+__global__ void store_final(float *x,int *mask,int nsamp,int ndm,float sigma)
 {
-  int i;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
+  int isamp,idm,idx;
 
-  for (i=threadID;i<n;i+=numThreads) {
-    x[i]*=mask[i];
-    if (x[i]<sigma) 
-      x[i]=0.0;
+  // Indices of input data
+  isamp=blockIdx.x*blockDim.x+threadIdx.x;
+  idm=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Compute valid threads
+  if (isamp<nsamp && idm<ndm) {
+    idx=isamp+idm*nsamp;
+    x[idx]*=mask[idx];
+    if (x[idx]<sigma) 
+      x[idx]=0.0;
   }
 
   return;
@@ -325,9 +349,11 @@ int read_info_file(char *fname,float *dt,float *dm,int *n)
   return 0;
 }
 
+
+
 int main(int argc,char *argv[])
 {
-  int i,j,k,nx,mx,my,ny,nsamp=0,m,mdetrend,ndetrend,ndm=2;
+  int i,j,k,nx,mx,my,ny,m,mdetrend,ndetrend,ndm=1,nsamp;
   cufftHandle ftr2cx,ftr2cy,ftc2rz;
   float *x,*y,*z,*dxs,*dzs,*fbuf;
   cufftReal *dx,*dy,*dz;
@@ -336,20 +362,25 @@ int main(int argc,char *argv[])
   int idist,odist,iembed,oembed,istride,ostride;
   int ds[]={2,3,4,6,9,14,20,30,45,70,100,150},dsmax=30;
   FILE *file;
-  float dt=0.0001,dm=0.0,sigma=5.0,wmax=0.0;
-  char *datfname,*inffname,*spfname;
-  int arg=0,len;
+  float sigma=5.0,wmax=0.0;
+  float dt,*dm;
+  char *datfname,*inffname,*spfname=NULL;
+  int arg=0,len,device=0;
   dim3 gridsize,blocksize;
 
   // Decode options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"hm:t:"))!=-1) {
+    while ((arg=getopt(argc,argv,"hm:t:d:"))!=-1) {
       switch(arg) {
 	
       case 't':
 	sigma=atof(optarg);
 	break;
 	
+      case 'd':
+	device=atoi(optarg);
+	break;
+
       case 'm':
 	wmax=atof(optarg);
 	break;
@@ -368,43 +399,57 @@ int main(int argc,char *argv[])
     return 0;
   }
 
-  // Set filenames
-  len=strlen(argv[optind]);
-  datfname=(char *) malloc(sizeof(char)*(len+2));
-  inffname=(char *) malloc(sizeof(char)*(len+2));
-  spfname=(char *) malloc(sizeof(char)*(len+15));
-
-  // Assuming timeseries filename ends in .dat
-  strcpy(datfname,argv[optind]);
-  argv[optind][len-4]='\0';
-  sprintf(inffname,"%s.inf",argv[optind]);
-  sprintf(spfname,"%s.singlepulse",argv[optind]);
-
-  // Read inf file
-  if (read_info_file(inffname,&dt,&dm,&nsamp)!=0)
+  // Number of dms
+  ndm=argc-optind;
+  if (ndm==0)
     return -1;
+  dm=(float *) malloc(sizeof(float)*ndm);
 
-  // Allocate signal timeseries
-  x=(float *) malloc(sizeof(float)*nsamp*ndm);
-  z=(float *) malloc(sizeof(float)*nsamp*ndm);
-  fbuf=(float *) malloc(sizeof(float)*nsamp);
+  // Loop over files (assumes all files have equal nsamp and dt)
+  for (i=optind,j=0;i<argc;i++,j++) {
+    // Set filenames
+    if (j==0) {
+      len=strlen(argv[i]);
+      datfname=(char *) malloc(sizeof(char)*(len+2));
+      inffname=(char *) malloc(sizeof(char)*(len+2));
+      spfname=(char *) malloc(sizeof(char)*(len+15));
+    }
 
-  // Open file
-  file=fopen(datfname,"r");
-  if (file==NULL) {
-    fprintf(stderr,"Error opening %s\n",datfname);
-    return -1;
+    // Assuming timeseries filename ends in .dat
+    strcpy(datfname,argv[i]);
+    argv[i][len-4]='\0';
+    sprintf(inffname,"%s.inf",argv[i]);
+    if (j==0)
+      sprintf(spfname,"%s.singlepulse",argv[i]);
+    
+    // Read inf file
+    if (read_info_file(inffname,&dt,&dm[j],&nsamp)!=0)
+      return -1;
+
+    // Allocate signal timeseries
+    if (j==0) {
+      x=(float *) malloc(sizeof(float)*nsamp*ndm);
+      z=(float *) malloc(sizeof(float)*nsamp*ndm);
+      fbuf=(float *) malloc(sizeof(float)*nsamp);
+    }
+
+    // Open file
+    file=fopen(datfname,"r");
+    if (file==NULL) {
+      fprintf(stderr,"Error opening %s\n",datfname);
+      return -1;
+    }
+
+    // Read buffer
+    fread(fbuf,sizeof(float),nsamp,file);
+
+    // Close file
+    fclose(file);
+
+    // Copy buffer
+    memcpy(x+j*nsamp,fbuf,sizeof(float)*nsamp);
   }
 
-  // Read buffer
-  fread(fbuf,sizeof(float),nsamp,file);
-
-  // Close file
-  fclose(file);
-
-  // Copy buffer
-  for (i=0;i<ndm;i++)
-    memcpy(x+i*nsamp,fbuf,sizeof(float)*nsamp);
 
   // Find number of kernels to convolve
   if (wmax>0.0) {
@@ -433,6 +478,9 @@ int main(int argc,char *argv[])
 
   printf("%d samples, %d point fft, %d ffts, %d kernels, %d detrend blocks of %d samples\n",nsamp,nx,ny,my,ndetrend,mdetrend);
 
+  // Set device
+  checkCudaErrors(cudaSetDevice(device));
+
   // Allocate device memory for signal
   checkCudaErrors(cudaMalloc((void **) &dxs,sizeof(float)*nsamp*ndm));
   checkCudaErrors(cudaMalloc((void **) &dzs,sizeof(float)*nsamp*ndm));
@@ -444,20 +492,20 @@ int main(int argc,char *argv[])
   detrend_and_normalize<<<gridsize,blocksize>>>(dxs,dzs,nsamp,mdetrend,ndetrend,ndm);
 
   // Allocate memory for padded signal
-  checkCudaErrors(cudaMalloc((void **) &dx,sizeof(cufftReal)*nx*ny));
+  checkCudaErrors(cudaMalloc((void **) &dx,sizeof(cufftReal)*nx*ny*ndm));
 
   // Padd signal
   blocksize.x=32;blocksize.y=32;blocksize.z=1;
-  gridsize.x=nx/blocksize.x+1;gridsize.y=ny/blocksize.y+1;gridsize.z=1;
-  padd_data<<<gridsize,blocksize>>>(dxs,dx,nsamp,nx,m,ny);
+  gridsize.x=nx/blocksize.x+1;gridsize.y=ny/blocksize.y+1;gridsize.z=ndm/blocksize.z+1;
+  padd_data<<<gridsize,blocksize>>>(dx,dxs,nsamp,nx,m,ny,ndm);
 
   // Allocate device memory
   y=(cufftReal *) malloc(sizeof(cufftReal)*nx*my);
   checkCudaErrors(cudaMalloc((void **) &dy,sizeof(cufftReal)*nx*my));
-  checkCudaErrors(cudaMalloc((void **) &dz,sizeof(cufftReal)*nx*ny));
-  checkCudaErrors(cudaMalloc((void **) &dcx,sizeof(cufftComplex)*mx*ny));
+  checkCudaErrors(cudaMalloc((void **) &dz,sizeof(cufftReal)*nx*ny*ndm));
+  checkCudaErrors(cudaMalloc((void **) &dcx,sizeof(cufftComplex)*mx*ny*ndm));
   checkCudaErrors(cudaMalloc((void **) &dcy,sizeof(cufftComplex)*mx*my));
-  checkCudaErrors(cudaMalloc((void **) &dcz,sizeof(cufftComplex)*mx*ny));
+  checkCudaErrors(cudaMalloc((void **) &dcz,sizeof(cufftComplex)*mx*ny*ndm));
 
   // Fill kernel
   for (j=0;j<my;j++) {
@@ -488,7 +536,7 @@ int main(int argc,char *argv[])
 
   // Plan and FFT signal
   idist=nx;  odist=mx;  iembed=nx;  oembed=nx;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftr2cx,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_R2C,ny));
+  checkCudaErrors(cufftPlanMany(&ftr2cx,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_R2C,ny*ndm));
   checkCudaErrors(cufftExecR2C(ftr2cx,(cufftReal *) dx,(cufftComplex *) dcx));
 
   // Plan and FFT window
@@ -502,50 +550,59 @@ int main(int argc,char *argv[])
 
   // Plan convolved signal
   idist=mx;  odist=nx;  iembed=mx;  oembed=mx;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2rz,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2R,ny));
+  checkCudaErrors(cufftPlanMany(&ftc2rz,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2R,ny*ndm));
 
   // Allocate mask
-  mask=(int *) malloc(sizeof(int)*nsamp);
-  checkCudaErrors(cudaMalloc((void **) &dmask,sizeof(int)*nsamp));
+  mask=(int *) malloc(sizeof(int)*nsamp*ndm);
+  checkCudaErrors(cudaMalloc((void **) &dmask,sizeof(int)*nsamp*ndm));
 
   // Allocate width
-  w=(int *) malloc(sizeof(int)*nsamp);
-  checkCudaErrors(cudaMalloc((void **) &dw,sizeof(int)*nsamp));
+  w=(int *) malloc(sizeof(int)*nsamp*ndm);
+  checkCudaErrors(cudaMalloc((void **) &dw,sizeof(int)*nsamp*ndm));
 
   // Set width
-  for (i=0;i<nsamp;i++)
+  for (i=0;i<nsamp*ndm;i++)
     w[i]=1;
 
   // Copy to device
-  checkCudaErrors(cudaMemcpy(dw,w,sizeof(int)*nsamp,cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(dw,w,sizeof(int)*nsamp*ndm,cudaMemcpyHostToDevice));
 
   // Loop over kernels
   for (k=0;k<my;k++) {
     // Complex multiplication
-    PointwiseComplexMultiply<<<256,256>>>(dcx,dcy,dcz,mx*ny,mx,k,1.0/(float) nx);
- 
-    // FFT convolved signal
+    blocksize.x=32;blocksize.y=32;blocksize.z=1;
+    gridsize.x=mx/blocksize.x+1;gridsize.y=ny/blocksize.y+1;gridsize.z=ndm/blocksize.z+1;
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(dcx,dcy,dcz,mx,ny,ndm,k,1.0/(float) nx);
+
+    // Inverse FFT convolved signal
     checkCudaErrors(cufftExecC2R(ftc2rz,(cufftComplex *) dcz,(cufftReal *) dz));
 
-    // Unpadd convolved signal
-    unpadd_data<<<256,256>>>(dzs,dz,nsamp,nx,m,ny);
-
+    // Unpadd convolved signal (create copy as well)
+    blocksize.x=32;blocksize.y=32;blocksize.z=1;
+    gridsize.x=nx/blocksize.x+1;gridsize.y=ny/blocksize.y+1;gridsize.z=ndm/blocksize.z+1;
+    unpadd_data<<<gridsize,blocksize>>>(dzs,dz,nsamp,nx,m,ny,ndm);
+    
     // Prune results
-    prune<<<256,256>>>(dzs,nsamp,ds[k],dmask,sigma);
+    blocksize.x=256;blocksize.y=4;blocksize.z=1;
+    gridsize.x=nsamp/blocksize.x+1;gridsize.y=ndm/blocksize.y+1;gridsize.z=1;
+    prune<<<gridsize,blocksize>>>(dzs,nsamp,ndm,ds[k],dmask,sigma);
 
     // Store
-    store<<<256,256>>>(dxs,dzs,dmask,dw,ds[k],nsamp);
+    blocksize.x=256;blocksize.y=4;blocksize.z=1;
+    gridsize.x=nsamp/blocksize.x+1;gridsize.y=ndm/blocksize.y+1;gridsize.z=1;
+    store<<<gridsize,blocksize>>>(dxs,dzs,dmask,dw,ds[k],nsamp,ndm);
   }
 
+ 
   // Prune final results
-  prune_final<<<256,256>>>(dxs,dw,dmask,nsamp,sigma);
+  prune_final<<<gridsize,blocksize>>>(dxs,dw,dmask,nsamp,ndm,sigma);
 
   // Store final results
-  store_final<<<256,256>>>(dxs,dmask,nsamp,sigma);
+  store_final<<<gridsize,blocksize>>>(dxs,dmask,nsamp,ndm,sigma);
 
   // Copy convolved signal to host
-  checkCudaErrors(cudaMemcpy(z,dxs,sizeof(cufftReal)*nsamp,cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(w,dw,sizeof(int)*nsamp,cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(z,dxs,sizeof(cufftReal)*nsamp*ndm,cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(w,dw,sizeof(int)*nsamp*ndm,cudaMemcpyDeviceToHost));
 
   // Open single pulse file
   file=fopen(spfname,"w");
@@ -555,14 +612,17 @@ int main(int argc,char *argv[])
   }
   // Print results
   fprintf(file,"# DM      Sigma      Time (s)     Sample    Downfact   Sampling (s)\n");
-  for (i=0,j=0;i<nsamp;i++) {
-    if (z[i]>sigma) {
-      fprintf(file,"%7.2f %7.2f %13.6f %10d     %3d   %g\n",dm,z[i],i*dt,i,w[i],dt);
-      j++;
+  for (k=0;k<ndm;k++) {
+    for (i=0,j=0;i<nsamp;i++) {
+      if (z[i+k*nsamp]>sigma) {
+	fprintf(file,"%8.3f %7.2f %13.6f %10d     %3d   %g\n",dm[k],z[i+k*nsamp],i*dt,i,w[i+k*nsamp],dt);
+	j++;
+      }
     }
+    printf("Found %d candidates at DM %8.3f\n",j,dm[k]);
   }
   fclose(file);
-  printf("Found %d candidates\n",j);
+
 
   // Destroy plans
   cufftDestroy(ftr2cx);
@@ -574,7 +634,10 @@ int main(int argc,char *argv[])
   free(y);
   free(z);
   free(w);
+  free(dm);
   free(mask);
+  free(fbuf);
+  cudaFree(dzs);
   cudaFree(dz);
   cudaFree(dcx);
   cudaFree(dcy);
