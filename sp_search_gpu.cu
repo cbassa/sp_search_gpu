@@ -35,28 +35,30 @@ static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,
     c[i]=ComplexScale(ComplexMul(a[i],b[i%m+j*m]),scale);
 }
 
-__global__ void padd_data(float *y,float *ytmp,int n,int nx,int m,int ny)
+__global__ void padd_data(float *y,float *ytmp,int nsamp,int nbin,int m,int nfft)
 {
-  int i,j,k,l;
-  int ioverlap;
-  const int numThreads=blockDim.x*gridDim.x;
-  const int threadID=blockIdx.x*blockDim.x+threadIdx.x;
+  int isamp,idx,ibin,ifft,ioverlap;
 
-  for (i=threadID;i<nx;i+=numThreads) {
-    ioverlap=(nx-m)/2;
-  
-    for (j=0;j<ny;j++) {
-      k=i+nx*j;
-      if (k<nx*ny) {
-	l=i+m*j-ioverlap;
-	if (l<0 || l>=n)
-	  ytmp[k]=0.0;
+  // Indices of input data                                                                    
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Compute valid threads
+  if (ibin<nbin && ifft<nfft) {
+    ioverlap=(nbin-m)/2;
+    
+    for (ifft=0;ifft<nfft;ifft++) {
+      idx=ibin+nbin*ifft;
+      if (idx<nbin*nfft) {
+	isamp=ibin+m*ifft-ioverlap;
+	if (isamp<0 || isamp>=nsamp)
+	  ytmp[idx]=0.0;
 	else
-	  ytmp[k]=y[l];
+	  ytmp[idx]=y[isamp];
       }
     }
   }
-
+  
   return;
 }
 
@@ -159,27 +161,32 @@ __global__ void store_final(float *x,int *mask,int n,float sigma)
   return;
 }
 
-__global__ void detrend_and_normalize(float *y,float *ytmp,int n,int m)
+__global__ void detrend_and_normalize(float *y,float *ytmp,int nsamp,int mdetrend,int ndetrend,int ndm)
 {
-  int i,j,k,l,k0,k1;
+  int j,l,isamp,isamp0,isamp1;
+  int idetrend,idm,idx;
   float x,s,sx,sxx,sy,sxy,syy,d,a,b;
-  int kmin,kmax,lmax;
+  int isampmin,isampmax,lmax;
   float ymin,ymax,yswap,ystd;
 
-  i=blockIdx.x*blockDim.x+threadIdx.x;
+  idetrend=blockIdx.x*blockDim.x+threadIdx.x;
+  idm=blockIdx.y*blockDim.y+threadIdx.y;
+  if (idetrend>=ndetrend || idm>=ndm)
+    return;
 
   // Compute sums
   s=sx=sxx=sy=sxy=0.0;
-  for (j=0;j<m;j++) {
-    k=i*m+j;
-    if (k>=n)
+  for (j=0;j<mdetrend;j++) {
+    isamp=idetrend*mdetrend+j;
+    idx=isamp+idm*nsamp;
+    if (isamp>=nsamp)
       break;
-    x=-0.5+(float) j/(float) m;
+    x=-0.5+(float) j/(float) mdetrend;
     s+=1.0;
     sx+=x;
     sxx+=x*x;
-    sy+=y[k];
-    sxy+=x*y[k];
+    sy+=y[idx];
+    sxy+=x*y[idx];
   }
 
   // Linear parameters
@@ -189,46 +196,47 @@ __global__ void detrend_and_normalize(float *y,float *ytmp,int n,int m)
 
   // Remove trend
   s=syy=0.0;
-  for (j=0;j<m;j++) {
-    k=i*m+j;
-    if (k>=n)
+  for (j=0;j<mdetrend;j++) {
+    isamp=idetrend*mdetrend+j;
+    idx=isamp+idm*nsamp;
+    if (isamp>=nsamp)
       break;
-    x=-0.5+(float) j/(float) m;
-    y[k]-=a+b*x;
-    ytmp[k]=y[k];
+    x=-0.5+(float) j/(float) mdetrend;
+    y[idx]-=a+b*x;
+    ytmp[idx]=y[idx];
     s+=1.0;
-    syy+=y[k]*y[k];
+    syy+=y[idx]*y[idx];
   }
 
   // Remove outliers 2.5% on either end
-  k0=i*m;
-  k1=(i+1)*m;
-  lmax=m;
-  if (k1>=n) {
-    lmax=n-i*m;
-    k1=n;
+  isamp0=idetrend*mdetrend;
+  isamp1=(idetrend+1)*mdetrend;
+  lmax=mdetrend;
+  if (isamp1>=nsamp) {
+    lmax=nsamp-idetrend*mdetrend;
+    isamp1=nsamp;
   }
   for (l=0;l<0.025*lmax;l++) {
     for (j=l;j<lmax-l;j++) {
-      k=k0+j;
-      if (k>=n)
+      isamp=isamp0+j;
+      if (isamp>=nsamp)
         break;
-      if (j==l || ytmp[k]<ymin) {
-        ymin=ytmp[k];
-        kmin=k;
+      if (j==l || ytmp[isamp+idm*nsamp]<ymin) {
+        ymin=ytmp[isamp+idm*nsamp];
+        isampmin=isamp;
       }
-      if (j==l || ytmp[k]>ymax) {
-        ymax=ytmp[k];
-        kmax=k;
+      if (j==l || ytmp[isamp+idm*nsamp]>ymax) {
+        ymax=ytmp[isamp+idm*nsamp];
+        isampmax=isamp;
       }
     }
 
-    yswap=ytmp[k0+l];
-    ytmp[k0+l]=ytmp[kmin];
-    ytmp[kmin]=yswap;
-    yswap=ytmp[k1-l-1];
-    ytmp[k1-l-1]=ytmp[kmax];
-    ytmp[kmax]=yswap;
+    yswap=ytmp[isamp0+l+idm*nsamp];
+    ytmp[isamp0+l+idm*nsamp]=ytmp[isampmin+idm*nsamp];
+    ytmp[isampmin+idm*nsamp]=yswap;
+    yswap=ytmp[isamp1-l-1+idm*nsamp];
+    ytmp[isamp1-l-1+idm*nsamp]=ytmp[isampmax+idm*nsamp];
+    ytmp[isampmax+idm*nsamp]=yswap;
 
     // Adjust sum
     syy-=ymin*ymin+ymax*ymax;
@@ -237,11 +245,11 @@ __global__ void detrend_and_normalize(float *y,float *ytmp,int n,int m)
   ystd=1.148*sqrt(syy/s);
 
   // Normalize
-  for (j=0;j<m;j++) {
-    k=i*m+j;
-    if (k>=n)
+  for (j=0;j<mdetrend;j++) {
+    isamp=idetrend*mdetrend+j;
+    if (isamp>=nsamp)
       break;
-    y[k]/=ystd;
+    y[isamp+idm*nsamp]/=ystd;
   }
 
   return;
@@ -319,19 +327,19 @@ int read_info_file(char *fname,float *dt,float *dm,int *n)
 
 int main(int argc,char *argv[])
 {
-  int i,j,k,nx,mx,my,ny,n=0,m,mdetrend,ndetrend;
+  int i,j,k,nx,mx,my,ny,nsamp=0,m,mdetrend,ndetrend,ndm=2;
   cufftHandle ftr2cx,ftr2cy,ftc2rz;
-  float *x,*y,*z,*dxs,*dzs;
+  float *x,*y,*z,*dxs,*dzs,*fbuf;
   cufftReal *dx,*dy,*dz;
   cufftComplex *dcx,*dcy,*dcz;
   int *dmask,*mask,*dw,*w;
   int idist,odist,iembed,oembed,istride,ostride;
   int ds[]={2,3,4,6,9,14,20,30,45,70,100,150},dsmax=30;
   FILE *file;
-  int nblock,nthread;
   float dt=0.0001,dm=0.0,sigma=5.0,wmax=0.0;
   char *datfname,*inffname,*spfname;
   int arg=0,len;
+  dim3 gridsize,blocksize;
 
   // Decode options
   if (argc>1) {
@@ -373,8 +381,30 @@ int main(int argc,char *argv[])
   sprintf(spfname,"%s.singlepulse",argv[optind]);
 
   // Read inf file
-  if (read_info_file(inffname,&dt,&dm,&n)!=0)
+  if (read_info_file(inffname,&dt,&dm,&nsamp)!=0)
     return -1;
+
+  // Allocate signal timeseries
+  x=(float *) malloc(sizeof(float)*nsamp*ndm);
+  z=(float *) malloc(sizeof(float)*nsamp*ndm);
+  fbuf=(float *) malloc(sizeof(float)*nsamp);
+
+  // Open file
+  file=fopen(datfname,"r");
+  if (file==NULL) {
+    fprintf(stderr,"Error opening %s\n",datfname);
+    return -1;
+  }
+
+  // Read buffer
+  fread(fbuf,sizeof(float),nsamp,file);
+
+  // Close file
+  fclose(file);
+
+  // Copy buffer
+  for (i=0;i<ndm;i++)
+    memcpy(x+i*nsamp,fbuf,sizeof(float)*nsamp);
 
   // Find number of kernels to convolve
   if (wmax>0.0) {
@@ -388,23 +418,6 @@ int main(int argc,char *argv[])
 	break;
     my=i;
   }
-
-  // Allocate signal timeseries
-  x=(float *) malloc(sizeof(float)*n);
-  z=(float *) malloc(sizeof(float)*n);
-
-  // Open file
-  file=fopen(datfname,"r");
-  if (file==NULL) {
-    fprintf(stderr,"Error opening %s\n",datfname);
-    return -1;
-  }
-
-  // Read buffer
-  fread(x,sizeof(float),n,file);
-
-  // Close file
-  fclose(file);
    
   // Sizes
   m=8000;
@@ -413,29 +426,30 @@ int main(int argc,char *argv[])
   mx=nx/2+1;
 
   // Number of FFTs
-  ny=(int) ceil(n/(float) m);
+  ny=(int) ceil(nsamp/(float) m);
 
   // Number of detrend lengths
-  ndetrend=(int) ceil(n/(float) mdetrend);
+  ndetrend=(int) ceil(nsamp/(float) mdetrend);
 
-  printf("%d samples, %d point fft, %d ffts, %d kernels, %d detrend blocks of %d samples\n",n,nx,ny,my,ndetrend,mdetrend);
+  printf("%d samples, %d point fft, %d ffts, %d kernels, %d detrend blocks of %d samples\n",nsamp,nx,ny,my,ndetrend,mdetrend);
 
   // Allocate device memory for signal
-  checkCudaErrors(cudaMalloc((void **) &dxs,sizeof(float)*n));
-  checkCudaErrors(cudaMalloc((void **) &dzs,sizeof(float)*n));
-  checkCudaErrors(cudaMemcpy(dxs,x,sizeof(float)*n,cudaMemcpyHostToDevice));
-
-  nthread=256;
-  nblock=ndetrend/nthread+1;
+  checkCudaErrors(cudaMalloc((void **) &dxs,sizeof(float)*nsamp*ndm));
+  checkCudaErrors(cudaMalloc((void **) &dzs,sizeof(float)*nsamp*ndm));
+  checkCudaErrors(cudaMemcpy(dxs,x,sizeof(float)*nsamp*ndm,cudaMemcpyHostToDevice));
 
   // Detrend timeseries
-  detrend_and_normalize<<<nblock,nthread>>>(dxs,dzs,n,mdetrend);
+  blocksize.x=32;blocksize.y=32;blocksize.z=1;
+  gridsize.x=ndetrend/blocksize.x+1;gridsize.y=ndm/blocksize.y+1;gridsize.z=1;
+  detrend_and_normalize<<<gridsize,blocksize>>>(dxs,dzs,nsamp,mdetrend,ndetrend,ndm);
 
   // Allocate memory for padded signal
   checkCudaErrors(cudaMalloc((void **) &dx,sizeof(cufftReal)*nx*ny));
 
   // Padd signal
-  padd_data<<<256,256>>>(dxs,dx,n,nx,m,ny);
+  blocksize.x=32;blocksize.y=32;blocksize.z=1;
+  gridsize.x=nx/blocksize.x+1;gridsize.y=ny/blocksize.y+1;gridsize.z=1;
+  padd_data<<<gridsize,blocksize>>>(dxs,dx,nsamp,nx,m,ny);
 
   // Allocate device memory
   y=(cufftReal *) malloc(sizeof(cufftReal)*nx*my);
@@ -491,19 +505,19 @@ int main(int argc,char *argv[])
   checkCudaErrors(cufftPlanMany(&ftc2rz,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2R,ny));
 
   // Allocate mask
-  mask=(int *) malloc(sizeof(int)*n);
-  checkCudaErrors(cudaMalloc((void **) &dmask,sizeof(int)*n));
+  mask=(int *) malloc(sizeof(int)*nsamp);
+  checkCudaErrors(cudaMalloc((void **) &dmask,sizeof(int)*nsamp));
 
   // Allocate width
-  w=(int *) malloc(sizeof(int)*n);
-  checkCudaErrors(cudaMalloc((void **) &dw,sizeof(int)*n));
+  w=(int *) malloc(sizeof(int)*nsamp);
+  checkCudaErrors(cudaMalloc((void **) &dw,sizeof(int)*nsamp));
 
   // Set width
-  for (i=0;i<n;i++)
+  for (i=0;i<nsamp;i++)
     w[i]=1;
 
   // Copy to device
-  checkCudaErrors(cudaMemcpy(dw,w,sizeof(int)*n,cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(dw,w,sizeof(int)*nsamp,cudaMemcpyHostToDevice));
 
   // Loop over kernels
   for (k=0;k<my;k++) {
@@ -514,24 +528,24 @@ int main(int argc,char *argv[])
     checkCudaErrors(cufftExecC2R(ftc2rz,(cufftComplex *) dcz,(cufftReal *) dz));
 
     // Unpadd convolved signal
-    unpadd_data<<<256,256>>>(dzs,dz,n,nx,m,ny);
+    unpadd_data<<<256,256>>>(dzs,dz,nsamp,nx,m,ny);
 
     // Prune results
-    prune<<<256,256>>>(dzs,n,ds[k],dmask,sigma);
+    prune<<<256,256>>>(dzs,nsamp,ds[k],dmask,sigma);
 
     // Store
-    store<<<256,256>>>(dxs,dzs,dmask,dw,ds[k],n);
+    store<<<256,256>>>(dxs,dzs,dmask,dw,ds[k],nsamp);
   }
 
   // Prune final results
-  prune_final<<<256,256>>>(dxs,dw,dmask,n,sigma);
+  prune_final<<<256,256>>>(dxs,dw,dmask,nsamp,sigma);
 
   // Store final results
-  store_final<<<256,256>>>(dxs,dmask,n,sigma);
+  store_final<<<256,256>>>(dxs,dmask,nsamp,sigma);
 
   // Copy convolved signal to host
-  checkCudaErrors(cudaMemcpy(z,dxs,sizeof(cufftReal)*n,cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(w,dw,sizeof(int)*n,cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(z,dxs,sizeof(cufftReal)*nsamp,cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(w,dw,sizeof(int)*nsamp,cudaMemcpyDeviceToHost));
 
   // Open single pulse file
   file=fopen(spfname,"w");
@@ -541,7 +555,7 @@ int main(int argc,char *argv[])
   }
   // Print results
   fprintf(file,"# DM      Sigma      Time (s)     Sample    Downfact   Sampling (s)\n");
-  for (i=0,j=0;i<n;i++) {
+  for (i=0,j=0;i<nsamp;i++) {
     if (z[i]>sigma) {
       fprintf(file,"%7.2f %7.2f %13.6f %10d     %3d   %g\n",dm,z[i],i*dt,i,w[i],dt);
       j++;
